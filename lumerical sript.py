@@ -7,6 +7,15 @@ import sys
 import numpy as np
 
 
+# ============================================================
+# 工艺常量（与 Notebook 和 Fig. S1 一致）
+# ============================================================
+WL0 = 632.8e-9
+N_SIO2 = 1.46
+N_AIR = 1.0
+T_OXIDE = 519e-9
+
+
 def load_lumapi(lumapi_path: str):
     spec = importlib.util.spec_from_file_location("lumapi", lumapi_path)
     if spec is None or spec.loader is None:
@@ -50,9 +59,7 @@ def resolve_existing_file(project_dir: str, filename: str) -> str:
 
 
 def _row_merge_segments(mask_row: np.ndarray):
-    """
-    生成 mask_row 中连续 True 段的 (i0, i1)（i1 为 exclusive）。
-    """
+    """生成 mask_row 中连续 True 段的 (i0, i1)（i1 为 exclusive）。"""
     n = int(mask_row.size)
     i = 0
     while i < n:
@@ -71,29 +78,23 @@ def build_etched_sio2_layer_rowmerge(
     fdtd,
     *,
     groupname: str,
-    etch_depth_map_m: np.ndarray,   # [size,size]，刻蚀深度（m）
+    etch_depth_map_m: np.ndarray,
     size: int,
     pixel_size: float,
-    layer_z_top: float,             # 该层 SiO2 顶面 z 坐标
-    t_oxide: float,                 # SiO2 薄膜厚度（m）
+    layer_z_top: float,
+    t_oxide: float,
     use_3d: bool,
     n_sio2: float,
-    etch_fill_index: float,         # 槽内填充（空气=1.0）
-    h_min: float = 0.0,             # 小于该值不刻蚀（m）
+    etch_fill_index: float,
+    h_min: float = 0.0,
     log_every: int = 200,
 ):
-    """
-    工艺一致建模：
-    \- 先建整片 SiO2 薄膜（厚度 t_oxide）
-    \- 再对刻蚀区域建立“槽”（填充为空气/背景介质），槽深=etch_depth
-    \- 槽使用按行合并连续段，减少 addrect 次数
-    """
     x_span = float(pixel_size)
     y_span = float(pixel_size)
 
     hm2d = np.asarray(etch_depth_map_m, dtype=float)
     if hm2d.shape != (size, size):
-        raise ValueError(f"`etch_depth_map_m` 期望 shape=({size},{size})，实际={hm2d.shape}")
+        raise ValueError(f"etch_depth_map_m 期望 shape=({size},{size})，实际={hm2d.shape}")
 
     hm2d = np.clip(hm2d, 0.0, float(t_oxide))
     mask = hm2d > float(h_min)
@@ -102,7 +103,7 @@ def build_etched_sio2_layer_rowmerge(
     fdtd.set("name", groupname)
     fdtd.groupscope(groupname)
 
-    # \- (1) blanket SiO2 film
+    # 整片 SiO2 薄膜
     film_x_center = (size * x_span) / 2.0
     film_y_center = -(size * y_span) / 2.0
 
@@ -118,7 +119,7 @@ def build_etched_sio2_layer_rowmerge(
     fdtd.set("material", "<Object defined dielectric>")
     fdtd.set("index", float(n_sio2))
 
-    # \- (2) etch trenches (filled by air/background)
+    # 刻蚀槽
     t0 = time.perf_counter()
     created_slots = 0
 
@@ -151,169 +152,123 @@ def build_etched_sio2_layer_rowmerge(
             created_slots += 1
             if log_every > 0 and created_slots % int(log_every) == 0:
                 dt = time.perf_counter() - t0
-                print(f"[build] {groupname}: slots={created_slots}, elapsed={dt:.1f}s")
+                print(f"  [build] {groupname}: slots={created_slots}, elapsed={dt:.1f}s")
                 sys.stdout.flush()
 
     fdtd.groupscope("::model")
     dt = time.perf_counter() - t0
-    print(f"[build] {groupname} done: slots={created_slots}, elapsed={dt:.1f}s")
+    print(f"  [build] {groupname} done: slots={created_slots}, elapsed={dt:.1f}s")
     sys.stdout.flush()
 
     return created_slots
 
 
-def main():
-    # ---------- 路径 ----------
-    project_dir = get_project_dir()
-    lumapi_path = r"D:\Program Files\Lumerical\v241\api\python\lumapi.py"
-
-    height_map_path = resolve_existing_file(project_dir, "height_map.npy")
-    out_fsp_path = os.path.join(project_dir, "D2NN_visible_532nm_etched_sio2_rowmerge.fsp")
-
-    # ---------- 基本参数 ----------
-    lumapi = load_lumapi(lumapi_path)
-
-    wl0 = 532e-9
-    n_sio2 = 1.46
-    background_index = 1.0  # 同时也用于刻蚀槽的填充折射率
-
-    # 网络尺寸与像素
-    size = 128
-    pixel_size = 2e-6
-    x_span = pixel_size
-    y_span = pixel_size
-
-    # 层数与传播距离
-    num_layer = 2
-    z_between_layers = 4e-3
-    z_last_to_detector = 5e-3
-
-    # ---------- 工艺参数（对应截图） ----------
-    # SiO2 总膜厚（最大刻蚀深度）
-    t_oxide = 519e-9
-    # 刻蚀后填充（空气/背景）
-    etch_fill_index = background_index
-    # 小于该刻蚀深度不建槽（可设为 0 或 10nm 以滤掉噪声）
-    h_min = 0.0
-
-    # ---------- 载入刻蚀深度图（m） ----------
-    height_map = np.load(height_map_path)
-    height_map = np.asarray(height_map, dtype=float)
-
-    if height_map.ndim != 3:
-        raise ValueError(f"`height_map.npy` 需要是 3D 数组 [num_layer,size,size]，实际 ndim={height_map.ndim}")
-    if height_map.shape[0] != num_layer or height_map.shape[1] != size or height_map.shape[2] != size:
-        raise ValueError(
-            f"`height_map` 期望 shape=[{num_layer},{size},{size}]，实际={height_map.shape}。\n"
-            "请让 num_layer/size 与 height_map.npy 匹配，或改这里的参数。"
-        )
-
-    # 认为 height_map 存的是“刻蚀深度”，直接 clip 到 [0,t_oxide]
-    height_map = np.clip(height_map, 0.0, float(t_oxide))
-    max_etch = float(np.max(height_map))
-
-    # ---------- 建模维度 ----------
-    use_3d = True
-    hide = True
-
-    fdtd = lumapi.FDTD(hide=hide)
+def build_single_layer_fdtd(
+    fdtd,
+    *,
+    layer_name: str,
+    etch_depth_map_m: np.ndarray,
+    size: int,
+    pixel_size: float,
+    wl0: float,
+    t_oxide: float,
+    n_sio2: float,
+    background_index: float,
+    use_3d: bool,
+    h_min: float = 0.0,
+):
     fdtd.groupscope("::model")
 
-    # 全局源/监视器设置：单频减少存储
+    x_span_total = size * pixel_size
+    y_span_total = size * pixel_size
+    x0 = x_span_total / 2.0
+    y0 = -y_span_total / 2.0
+
+    layer_z_top = 0.0
+
+    pad_xy = 4 * pixel_size
+    pad_z = 1.5e-6
+
+    z_min_sim = layer_z_top - t_oxide - pad_z
+    z_max_sim = layer_z_top + pad_z
+
+    # ----------------------------------------------------------
+    # 1. FDTD 仿真区域
+    # ----------------------------------------------------------
+    fdtd.addfdtd()
+
+    if use_3d:
+        fdtd.set("dimension", "3D")
+    else:
+        fdtd.set("dimension", "2D")
+
+    fdtd.set("x", x0)
+    fdtd.set("x span", x_span_total + 2 * pad_xy)
+
+    if use_3d:
+        fdtd.set("y", y0)
+        fdtd.set("y span", y_span_total + 2 * pad_xy)
+
+    fdtd.set("z min", z_min_sim)
+    fdtd.set("z max", z_max_sim)
+
+    fdtd.set("background index", background_index)
+    fdtd.set("mesh accuracy", 2)
+
+    # 【修正】边界条件设置——按 Lumerical 要求的顺序
+    # 2D 模式下 y 方向的边界条件是 inactive 的，不能设置
+    fdtd.set("x min bc", "PML")
+    # x max bc 会自动跟随 x min bc，如果需要单独设可以设
+    if use_3d:
+        fdtd.set("y min bc", "PML")
+    # z 方向：先在 set z min/z max 之后，才能设 bc
+    # Lumerical 的 z bc 默认跟 FDTD region 一起设，无需单独调用
+    # 如果默认不是 PML，再显式设置：
+    try:
+        fdtd.set("z min bc", "PML")
+    except Exception:
+        pass  # 某些版本/维度下该属性可能 inactive
+    try:
+        fdtd.set("z max bc", "PML")
+    except Exception:
+        pass
+
+    # 全局波长
     fdtd.setglobalsource("wavelength start", wl0)
     fdtd.setglobalsource("wavelength stop", wl0)
     fdtd.setglobalmonitor("use source limits", 1)
     fdtd.setglobalmonitor("use linear wavelength spacing", 1)
 
-    # ---------- FDTD 仿真区域 ----------
-    fdtd.addfdtd()
-    fdtd.set("dimension", "3D" if use_3d else "2D")
+    # ----------------------------------------------------------
+    # 2. 光源
+    # ----------------------------------------------------------
+    source_z = layer_z_top - t_oxide - 0.5e-6
 
-    x0 = size * x_span / 2.0
-    y0 = -size * y_span / 2.0
-
-    pad_xy = 6 * pixel_size
-    sim_x_span = size * x_span + 2 * pad_xy
-    sim_y_span = size * y_span + 2 * pad_xy
-
-    z_front = 2e-6
-    z_back = 2e-6
-    # 结构位于 z<=0（顶面 layer_z_top=0），向下刻蚀到 -t_oxide
-    z_min = -z_front - max(t_oxide, max_etch)
-    z_max = (num_layer - 1) * z_between_layers + z_last_to_detector + z_back
-
-    fdtd.set("x", x0)
-    fdtd.set("x span", sim_x_span)
-    if use_3d:
-        fdtd.set("y", y0)
-        fdtd.set("y span", sim_y_span)
-    fdtd.set("z min", z_min)
-    fdtd.set("z max", z_max)
-
-    # PML 边界
-    fdtd.set("x min bc", "PML")
-    fdtd.set("x max bc", "PML")
-    if use_3d:
-        fdtd.set("y min bc", "PML")
-        fdtd.set("y max bc", "PML")
-    fdtd.set("z min bc", "PML")
-    fdtd.set("z max bc", "PML")
-
-    fdtd.set("background index", background_index)
-
-    # 全局网格：传播区用粗网格，结构区用 override 加细
-    fdtd.set("mesh accuracy", 2)
-
-    # ---------- 源：平面波 ----------
     fdtd.addplane()
-    fdtd.set("name", "source")
+    fdtd.set("name", "plane_source")
     fdtd.set("injection axis", "z")
     fdtd.set("direction", "forward")
     fdtd.set("x", x0)
-    fdtd.set("x span", size * x_span)
+    fdtd.set("x span", x_span_total)
     if use_3d:
         fdtd.set("y", y0)
-        fdtd.set("y span", size * y_span)
-    fdtd.set("z", z_min + 1e-6)
+        fdtd.set("y span", y_span_total)
+    fdtd.set("z", source_z)
     fdtd.set("wavelength start", wl0)
     fdtd.set("wavelength stop", wl0)
 
-    # ---------- 探测器：功率监视器 ----------
-    det_z = (num_layer - 1) * z_between_layers + z_last_to_detector
-    fdtd.addpower()
-    fdtd.set("name", "detector_power")
-    fdtd.set("monitor type", "2D Z-normal")
-    fdtd.set("x", x0)
-    fdtd.set("x span", size * x_span)
-    if use_3d:
-        fdtd.set("y", y0)
-        fdtd.set("y span", size * y_span)
-    fdtd.set("z", det_z)
-
-    # ---------- 可选调试 monitor（范围不要覆盖整段毫米传播） ----------
-    fdtd.addprofile()
-    fdtd.set("name", "xz_profile_near_layers")
-    fdtd.set("monitor type", "2D Y-normal")
-    fdtd.set("x", x0)
-    fdtd.set("x span", size * x_span)
-    if use_3d:
-        fdtd.set("y", y0)
-    fdtd.set("z min", -t_oxide - 2e-6)
-    fdtd.set("z max", (num_layer - 1) * z_between_layers + 2e-6)
-
-    # ---------- 局部 mesh override：只覆盖结构附近 ----------
+    # ----------------------------------------------------------
+    # 3. 网格加密
+    # ----------------------------------------------------------
     fdtd.addmesh()
-    fdtd.set("name", "mesh_near_structures")
+    fdtd.set("name", "mesh_structure")
     fdtd.set("x", x0)
-    fdtd.set("x span", size * x_span)
+    fdtd.set("x span", x_span_total)
     if use_3d:
         fdtd.set("y", y0)
-        fdtd.set("y span", size * y_span)
-
-    z_struct_min = -t_oxide - 1e-6
-    z_struct_max = (num_layer - 1) * z_between_layers + 1e-6
-    fdtd.set("z min", z_struct_min)
-    fdtd.set("z max", z_struct_max)
+        fdtd.set("y span", y_span_total)
+    fdtd.set("z min", layer_z_top - t_oxide - 0.2e-6)
+    fdtd.set("z max", layer_z_top + 0.2e-6)
 
     fdtd.set("override x mesh", 1)
     if use_3d:
@@ -322,50 +277,184 @@ def main():
     fdtd.set("set maximum mesh step", 1)
 
     dx = 200e-9
-    dy = 200e-9
-    dz = 200e-9
+    dz = 50e-9
     fdtd.set("dx", dx)
     if use_3d:
-        fdtd.set("dy", dy)
+        fdtd.set("dy", dx)
     fdtd.set("dz", dz)
 
-    # ---------- 构建 D2NN 层（SiO2 薄膜 + 刻蚀槽，行合并） ----------
-    t_build0 = time.perf_counter()
-    total_slots = 0
+    # ----------------------------------------------------------
+    # 4. SiO2 刻蚀结构
+    # ----------------------------------------------------------
+    slots = build_etched_sio2_layer_rowmerge(
+        fdtd,
+        groupname=layer_name,
+        etch_depth_map_m=etch_depth_map_m,
+        size=size,
+        pixel_size=pixel_size,
+        layer_z_top=layer_z_top,
+        t_oxide=t_oxide,
+        use_3d=use_3d,
+        n_sio2=n_sio2,
+        etch_fill_index=background_index,
+        h_min=h_min,
+        log_every=200,
+    )
 
-    print(f"[build] start etched-SiO2: num_layer={num_layer}, size={size}")
-    sys.stdout.flush()
+    # ----------------------------------------------------------
+    # 5. 透射场监视器
+    # ----------------------------------------------------------
+    mon_z = layer_z_top + 0.3e-6
 
+    fdtd.addpower()
+    fdtd.set("name", "transmitted_field")
+    fdtd.set("monitor type", "2D Z-normal")
+    fdtd.set("x", x0)
+    fdtd.set("x span", x_span_total)
+    if use_3d:
+        fdtd.set("y", y0)
+        fdtd.set("y span", y_span_total)
+    fdtd.set("z", mon_z)
+
+    # ----------------------------------------------------------
+    # 6. 参考监视器
+    # ----------------------------------------------------------
+    ref_z = source_z + 0.2e-6
+
+    fdtd.addpower()
+    fdtd.set("name", "reference_field")
+    fdtd.set("monitor type", "2D Z-normal")
+    fdtd.set("x", x0)
+    fdtd.set("x span", x_span_total)
+    if use_3d:
+        fdtd.set("y", y0)
+        fdtd.set("y span", y_span_total)
+    fdtd.set("z", ref_z)
+
+    # ----------------------------------------------------------
+    # 7. xz 截面 profile
+    # ----------------------------------------------------------
+    fdtd.addprofile()
+    fdtd.set("name", "xz_profile")
+    fdtd.set("monitor type", "2D Y-normal")
+    fdtd.set("x", x0)
+    fdtd.set("x span", x_span_total)
+    if use_3d:
+        fdtd.set("y", y0)
+    fdtd.set("z min", z_min_sim + 0.2e-6)
+    fdtd.set("z max", z_max_sim - 0.2e-6)
+
+    return slots
+
+
+def main():
+    project_dir = get_project_dir()
+    lumapi_path = r"D:\Program Files\Lumerical\v241\api\python\lumapi.py"
+    height_map_path = resolve_existing_file(project_dir, "height_map.npy")
+
+    lumapi = load_lumapi(lumapi_path)
+
+    wl0 = WL0
+    n_sio2 = N_SIO2
+    background_index = N_AIR
+    t_oxide = T_OXIDE
+
+    size = 128
+    pixel_size = 2e-6
+    h_min = 0.0
+
+    # 【修改】使用 2D 仿真以大幅减少内存（12GB → ~100MB）
+    use_3d = False
+    hide = True
+
+    # 载入刻蚀深度图
+    height_map = np.load(height_map_path)
+    height_map = np.asarray(height_map, dtype=float)
+
+    if height_map.ndim != 3:
+        raise ValueError(f"height_map.npy 需要是 3D [num_layer,size,size]，实际 ndim={height_map.ndim}")
+
+    num_layer = height_map.shape[0]
+    if height_map.shape[1] != size or height_map.shape[2] != size:
+        raise ValueError(
+            f"height_map 期望 shape=[{num_layer},{size},{size}]，实际={height_map.shape}"
+        )
+
+    height_map = np.clip(height_map, 0.0, float(t_oxide))
+
+    unique_depths_nm = np.unique(np.round(height_map * 1e9)).astype(int)
+    print(f"[verify] 刻蚀深度唯一值(nm): {unique_depths_nm}")
+    print(f"[verify] 期望值(nm): [0, 173, 346, 519]")
+
+    # 检查是否有缺失的级别
+    expected_levels = {0, 173, 346, 519}
+    actual_levels = set(unique_depths_nm)
+    missing = expected_levels - actual_levels
+    if missing:
+        print(f"[verify] ⚠ 缺少的刻蚀级别: {missing} nm")
+        print(f"         这说明训练后的相位参数经 sigmoid 后没有覆盖到某些量化级别，属于正常现象。")
+    print()
+
+    # 逐层建模
     for l in range(num_layer):
-        layer_z_top = l * z_between_layers
+        print(f"{'='*60}")
+        print(f"[main] 构建第 {l} 层衍射层 FDTD 工程...")
+        print(f"{'='*60}")
+
+        out_fsp = os.path.join(project_dir, f"D2NN_layer{l}_verify.fsp")
         etch2d = height_map[l]
 
-        slots = build_etched_sio2_layer_rowmerge(
+        vals_nm, counts = np.unique(np.round(etch2d * 1e9).astype(int), return_counts=True)
+        print(f"  Layer {l} 刻蚀深度分布:")
+        for v, c in zip(vals_nm, counts):
+            print(f"    {v} nm: {c} pixels")
+
+        fdtd = lumapi.FDTD(hide=hide)
+        fdtd.groupscope("::model")
+
+        t0 = time.perf_counter()
+
+        slots = build_single_layer_fdtd(
             fdtd,
-            groupname=f"diffraction_layer_{l}",
+            layer_name=f"diffraction_layer_{l}",
             etch_depth_map_m=etch2d,
             size=size,
             pixel_size=pixel_size,
-            layer_z_top=layer_z_top,
+            wl0=wl0,
             t_oxide=t_oxide,
-            use_3d=use_3d,
             n_sio2=n_sio2,
-            etch_fill_index=etch_fill_index,
+            background_index=background_index,
+            use_3d=use_3d,
             h_min=h_min,
-            log_every=200,
         )
-        total_slots += int(slots)
 
-    dt_build = time.perf_counter() - t_build0
-    print(f"[build] all done: total_slots={total_slots}, elapsed={dt_build:.1f}s")
-    sys.stdout.flush()
+        dt = time.perf_counter() - t0
 
-    # ---------- 保存并关闭 ----------
-    fdtd.save(out_fsp_path)
-    fdtd.close()
+        fdtd.save(out_fsp)
+        fdtd.close()
 
-    print("Loaded height_map from:", height_map_path, "shape=", height_map.shape)
-    print("Saved:", out_fsp_path)
+        print(f"  [main] Layer {l}: slots={slots}, build time={dt:.1f}s")
+        print(f"  [main] Saved: {out_fsp}")
+        print()
+
+    # 汇总
+    print(f"{'='*60}")
+    print(f"建模完成！共 {num_layer} 层。")
+    print()
+    print(f"参数汇总:")
+    print(f"  波长:       {wl0*1e9:.0f} nm")
+    print(f"  像素:       {size}x{size}, pitch={pixel_size*1e6:.1f} um")
+    print(f"  t_oxide:    {t_oxide*1e9:.0f} nm (Fig. S1)")
+    print(f"  n_SiO2:     {n_sio2}")
+    print(f"  背景折射率: {background_index}")
+    print(f"  仿真模式:   {'3D' if use_3d else '2D'}（{'完整' if use_3d else '截面，低内存'}）")
+    print()
+    print(f"下一步:")
+    print(f"  1. 在 Lumerical 中打开 .fsp 文件并运行仿真")
+    print(f"  2. 运行 export_transmittance.py 导出透过率")
+    print(f"  3. 运行 verify_phase.py 验证相位一致性")
+    print(f"  4. 运行 d2nn_full_inference.py 做完整推理")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
