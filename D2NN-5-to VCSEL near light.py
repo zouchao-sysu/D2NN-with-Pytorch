@@ -772,7 +772,7 @@ for L in (4, 8, 16, 32,64):
 
 torch.save({
     'orig_state_dict': model.state_dict(),
-    'model_32_state_dict': quantize_model_phases_general(model, 32, mapping=mapping).state_dict(),
+    'model_32_state_dict': quantize_model_phases_consistent (model, 32, mapping=mapping).state_dict(),
 }, 'quantized_models_32.pt')
 
 print("Quantization + evaluation done.")
